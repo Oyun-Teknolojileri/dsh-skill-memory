@@ -1,0 +1,10 @@
+# dependencies, if this checkout is ever used as a working copy
+node_modules/
+
+# local memory stores, written when the plugin runs against this directory
+.dsh-skill-memory.json
+.dsh-skill-memory.config.json
+
+# editor and OS noise
+.DS_Store
+*.log

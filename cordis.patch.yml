@@ -1,0 +1,15 @@
+# Skill Memory - profile patch layer.
+#
+# A profile boots by composing its entry list from every bundle layer in
+# package.json's `dsh.profile.bundles`, then the profile's own cordis.patch.yml.
+# This file is this package's layer, and `insert` appends a row to that
+# composed list.
+#
+# The row lands on the HOST plane: the plugin mounts once for the whole
+# process, so every session gets the pre-step recall, the end-of-turn
+# learning, and the `skill_memory` tool without any agent preset carrying it.
+# The plugin publishes no service - it only consumes `tools`, `fs`, `llm` and
+# `sessions` - so it needs no isolate realm.
+- insert:
+    - id: skill-memory
+      name: dsh-skill-memory
