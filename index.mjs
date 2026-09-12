@@ -16,11 +16,17 @@
 // they appear in the source, never as the user typed them. Symbols are verified
 // against the referenced file at capture time.
 //
-// Configuration: one source only, the workspace config file
+// Configuration: aliases live in exactly one place, the workspace config file
 //   <workspace>/.dsh-skill-memory.config.json
-// with the keys aliases, globalStore and home. There is no machine-level layer
-// and no implicit default: if globalStore is absent, the global layer is simply
-// disabled, and global-scope skills stay in the workspace store.
+// with an "aliases" object of { name: absolute path }, plus optional globalStore
+// and home. There is NO machine-level alias table: a skill carries the alias
+// NAME and the config carries the path, so a learned skill set that is moved to
+// another machine keeps its names and only needs the values again. When a name
+// has no value the entry point stays unresolved, the recall block says so, and
+// the agent asks the user for the path and records it with
+// `skill_memory action=alias` -- the plugin never guesses a path.
+// The only machine-level setting is where the global store lives; it defaults
+// to a file beside the settings document.
 //
 // Portability: this source contains no machine-specific values, and persisted
 // skill records never embed an absolute workspace path.
@@ -80,6 +86,22 @@ function joinPath(base, name) {
   const right = stripLeadingSlash(name)
   if (left.length === 0 || left === '.') return right
   return left + '/' + right
+}
+
+// Directory part of a path, for both separator styles. Empty when there is none.
+function dirName(value) {
+  const path = String(value || '')
+  let cut = -1
+  for (let index = path.length - 1; index >= 0; index -= 1) {
+    const ch = path.charAt(index)
+    if (ch === '/' || ch === '\\') {
+      cut = index
+      break
+    }
+  }
+  if (cut < 0) return ''
+  if (cut === 0) return '/'
+  return path.slice(0, cut)
 }
 
 function isAbsolutePath(value) {
@@ -372,10 +394,20 @@ async function resolveStorePath(ctx, cwd, raw) {
   }
 }
 
-// One source only: the workspace config file. No machine layer and no implicit
-// default, so where the global store lives is always an explicit decision.
-async function readConfig(ctx, cwd) {
+// Aliases come from the workspace config file only. The machine layer may still
+// contribute `home` (tilde expansion) and `globalStore`; it never contributes an
+// alias, so the alias table always travels with the workspace it belongs to.
+async function readConfig(ctx, cwd, machine) {
   const config = { aliases: {}, globalStore: '', globalStoreError: '', home: '', configFile: '', configRead: false, globalSource: '' }
+  if (machine !== undefined && machine !== null) {
+    if (typeof machine.home === 'string' && machine.home.length > 0) config.home = stripTrailingSlash(machine.home)
+    if (typeof machine.globalStore === 'string' && machine.globalStore.length > 0) {
+      config.globalStore = machine.globalStore
+      config.globalSource = typeof machine.globalStoreSource === 'string' && machine.globalStoreSource.length > 0
+        ? machine.globalStoreSource
+        : 'machine settings: skill-memory.globalStore'
+    }
+  }
   let parsed
   try {
     parsed = await readJsonFile(ctx, joinPath(cwd, CONFIG_FILE), cwd)
@@ -437,14 +469,118 @@ function describeRepoRoots(config, cwd) {
   return lines.join('\n')
 }
 
+// Alias names that these skills reference but the workspace config does not
+// define. This is the whole portability story: the name travelled with the skill
+// and only the value is missing, so the plugin can say exactly what to ask for.
+function unresolvedAliasNames(state, cwd, skills) {
+  const names = []
+  for (const skill of skills) {
+    for (const ref of skill.refs || []) {
+      if (ref.repo === 'self' || ref.repo === 'workspace') continue
+      if (resolveRepoRoot(state.config, cwd, ref.repo).length > 0) continue
+      if (names.indexOf(ref.repo) < 0) names.push(ref.repo)
+    }
+  }
+  return names
+}
+
+function skillsUsingAlias(skills, name) {
+  const users = []
+  for (const skill of skills) {
+    for (const ref of skill.refs || []) {
+      if (ref.repo !== name) continue
+      if (users.indexOf(skill.name) < 0) users.push(skill.name)
+      break
+    }
+  }
+  return users
+}
+
+function aliasReport(state, cwd) {
+  const lines = []
+  const names = Object.keys(state.config.aliases)
+  lines.push('config file: ' + (state.config.configRead ? state.config.configFile : joinPath(cwd, CONFIG_FILE) + ' (not created yet)'))
+  if (names.length === 0) lines.push('defined aliases: none')
+  for (const name of names) {
+    const root = resolveRepoRoot(state.config, cwd, name)
+    const users = skillsUsingAlias(state.skills, name)
+    lines.push('alias ' + name + ' -> ' + root + (users.length > 0 ? '  (used by: ' + users.join(', ') + ')' : ''))
+  }
+  const missing = unresolvedAliasNames(state, cwd, state.skills)
+  for (const name of missing) {
+    lines.push('alias ' + name + ' -> NO VALUE  (used by: ' + skillsUsingAlias(state.skills, name).join(', ') + ')  ask the user for the path, then record it with action=alias')
+  }
+  return lines
+}
+
+// Write one alias into the workspace config, preserving every other key. A file
+// that is not valid JSON is left untouched and reported instead of overwritten,
+// so a hand-edited config is never destroyed by an automatic write.
+async function writeAliasValue(ctx, cwd, name, value) {
+  const fs = ctx.get('fs')
+  if (fs === undefined) return { ok: false, message: 'fs service is unavailable, cannot write the config file' }
+  if (cwd.length === 0) return { ok: false, message: 'no workspace path resolved, cannot write the config file' }
+  const file = joinPath(cwd, CONFIG_FILE)
+  const target = await fs.resolve(file, {})
+  let existing = ''
+  try {
+    existing = await fs.readText(target)
+  } catch (error) {
+    existing = ''
+  }
+  let document = {}
+  if (existing.trim().length > 0) {
+    let parsed
+    try {
+      parsed = JSON.parse(existing)
+    } catch (error) {
+      return { ok: false, message: file + ' is not valid JSON (' + errorText(error) + '); fix the file by hand so no other key is lost' }
+    }
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return { ok: false, message: file + ' does not contain a JSON object; fix the file by hand' }
+    }
+    document = parsed
+  }
+  const aliases = document.aliases !== null && typeof document.aliases === 'object' && !Array.isArray(document.aliases) ? document.aliases : {}
+  let verb = ''
+  if (value.length === 0) {
+    if (aliases[name] === undefined) return { ok: false, message: 'alias ' + name + ' is not defined in ' + file }
+    delete aliases[name]
+    verb = 'removed alias ' + name
+  } else {
+    aliases[name] = value
+    verb = 'stored alias ' + name
+  }
+  document.aliases = aliases
+  await fs.writeText(target, JSON.stringify(document, null, 2) + '\n')
+  const check = await fs.stat(target)
+  if (check === undefined || check === null) return { ok: false, message: 'write reported success but ' + file + ' is not readable' }
+  storeCache.delete(cwd)
+  if (value.length === 0) return { ok: true, message: verb + ' in ' + file }
+  let exists = false
+  try {
+    const info = await fs.stat(await fs.resolve(value, {}))
+    exists = info !== undefined && info !== null
+  } catch (error) {
+    exists = false
+  }
+  return {
+    ok: true,
+    message: verb + ' = ' + value + ' in ' + file + (exists ? '' : ' (warning: that path does not exist right now, so its entry points stay unresolved)'),
+  }
+}
+
 // ------------------------------------------------------------------ store
 const storeCache = new Map()
 
-async function loadState(ctx, cwd) {
+async function loadState(ctx, cwd, machine) {
+  // The machine layer can change while the process runs (a settings edit), so the
+  // cached state is keyed by its resolved values and rebuilt when they differ.
+  const signature = machine === undefined ? '' : JSON.stringify(machine)
   const cached = storeCache.get(cwd)
-  if (cached !== undefined) return cached
-  const config = await readConfig(ctx, cwd)
-  const state = { skills: [], config: config, globalWritable: false, globalError: config.globalStoreError, globalRead: false, globalResolved: '' }
+  if (cached !== undefined && cached.signature === signature) return cached
+  const config = await readConfig(ctx, cwd, machine)
+  const state = { skills: [], config: config, signature: signature, globalWritable: false, globalError: config.globalStoreError, globalRead: false, globalResolved: '' }
   if (cwd.length > 0) {
     if (config.globalStore.length > 0) {
       state.globalWritable = true
@@ -579,7 +715,7 @@ function buildRefLines(state, cwd, skill) {
   for (const ref of skill.refs || []) {
     const resolved = resolveRefPath(state.config, cwd, ref)
     if (resolved.length === 0) {
-      lines.push('  - ' + refToString(ref) + '  [alias not defined, unresolved]')
+      lines.push('  - ' + refToString(ref) + '  [alias "' + ref.repo + '" has no path in the workspace config, unresolved]')
       continue
     }
     let line = '  - ' + refToString(ref) + '  ->  ' + resolved
@@ -597,7 +733,7 @@ async function checkRefs(ctx, cwd, state) {
     for (const ref of skill.refs || []) {
       const resolved = resolveRefPath(state.config, cwd, ref)
       if (resolved.length === 0) {
-        notes.push(refToString(ref) + ': alias not defined')
+        notes.push(refToString(ref) + ': alias "' + ref.repo + '" has no path in the workspace config; ask the user for it and record it with skill_memory action=alias')
         continue
       }
       try {
@@ -663,6 +799,14 @@ async function recall(ctx, cwd, state, query) {
       parts.push('Entry points:')
       for (const line of refLines) parts.push(line)
     }
+  }
+  // A name that travelled with a skill but has no value here is the one thing a
+  // moved skill set cannot fix by itself, so it is stated once for the block.
+  const missingAliases = unresolvedAliasNames(state, cwd, chosen.map((entry) => entry.skill))
+  if (missingAliases.length > 0) {
+    parts.push('')
+    parts.push('Unresolved repo aliases: ' + missingAliases.join(', ') + '.')
+    parts.push('The workspace config defines no path for these, so entry points that use them cannot be read. If you need one, ask the user for the path and record it with skill_memory action=alias alias=<name> path=<absolute path>. Never guess a path, and do not use the file if the path is still unknown.')
   }
   let text = parts.join('\n')
   if (text.length > MAX_RECALL_CHARS) text = text.slice(0, MAX_RECALL_CHARS) + '\n...(recall truncated)'
@@ -899,8 +1043,12 @@ const EXTRACT_SYSTEM = [
   'visible anywhere in the turn, leave that ref symbol empty instead of inventing it.',
   '',
   'REPO ROUTING: a ref names its repo. Use "self" only when the file lives under',
-  'the workspace root. When the file lives in another repository listed in REPO',
-  'ROOTS, use that alias as repo and give the path relative to that alias root.',
+  'the workspace root. Use an alias from REPO ROOTS when the file lives in one of',
+  'those repositories, with the path relative to that alias root. When the file',
+  'lives in a repository that is NOT listed, mint a short lowercase alias name from',
+  'its directory name (letters, digits, dash, underscore only) and give the path',
+  'relative to that repository root: the alias VALUE is supplied later, so the name',
+  'is what has to be right.',
   '',
   'Extract these kinds of knowledge:',
   '- kind "api": a concrete entry point: the file, the class or function, and the',
@@ -992,7 +1140,7 @@ function buildDigest(messages) {
 }
 
 async function analyzeTurn(ctx, sessionId, cwd, digest, diag) {
-  const state = await loadState(ctx, cwd)
+  const state = await loadState(ctx, cwd, machineConfig())
   const existing = state.skills.map((skill) => ({
     id: skill.id,
     name: skill.name,
@@ -1106,6 +1254,8 @@ export default {
         enabled: z.boolean().default(true),
         recall: z.boolean().default(true),
         learn: z.boolean().default(true),
+        globalStore: z.string().default(''),
+        home: z.string().default(''),
       }), { applies: 'live' })
       settingsService = candidate
       settingsRegistered = true
@@ -1153,6 +1303,53 @@ export default {
         enabled: value.enabled !== false,
         recall: value.recall !== false,
         learn: value.learn !== false,
+      }
+    }
+
+    // The only machine-wide configuration is where the global store lives. Aliases
+    // are deliberately NOT here: they belong to the workspace that carries the
+    // skills, so they are read from the workspace config file only.
+    // Zero-config global store: the harness home already holds the settings
+    // document, so the global store defaults to a sibling file there. Nothing has
+    // to be typed, and an explicit `globalStore` still wins.
+    function defaultGlobalStore() {
+      if (settingsService === undefined) return ''
+      let documentPath = ''
+      try {
+        documentPath = settingsService.documentPath
+      } catch (error) {
+        return ''
+      }
+      if (typeof documentPath !== 'string' || documentPath.length === 0) return ''
+      const directory = dirName(documentPath)
+      if (directory.length === 0) return ''
+      return joinPath(directory, 'skill-memory.json')
+    }
+
+    function machineConfig() {
+      const fallback = { globalStore: '', home: '', globalStoreSource: '' }
+      if (settingsService === undefined) return fallback
+      let value
+      try {
+        value = settingsService.get('skill-memory')
+      } catch (error) {
+        return fallback
+      }
+      if (value === null || typeof value !== 'object') return fallback
+      const configuredStore = typeof value.globalStore === 'string' ? value.globalStore.trim() : ''
+      let globalStore = configuredStore
+      let globalStoreSource = configuredStore.length > 0 ? 'machine settings: skill-memory.globalStore' : ''
+      if (globalStore.length === 0) {
+        const derived = defaultGlobalStore()
+        if (derived.length > 0) {
+          globalStore = derived
+          globalStoreSource = 'default: beside the settings document'
+        }
+      }
+      return {
+        globalStore: globalStore,
+        home: typeof value.home === 'string' ? value.home.trim() : '',
+        globalStoreSource: globalStoreSource,
       }
     }
 
@@ -1319,7 +1516,7 @@ export default {
           diag.noWorkspace += 1
           return decision
         }
-        const state = await loadState(ctx, cwd)
+        const state = await loadState(ctx, cwd, machineConfig())
         const recalled = await recall(ctx, cwd, state, query)
         const scores = []
         for (const hit of recalled.hits) scores.push(hit.name + '=' + hit.score.toFixed(2))
@@ -1346,13 +1543,15 @@ export default {
 
     const tool = {
       name: 'skill_memory',
-      description: 'Inspect or edit the automatic workspace skill memory. Actions: list, search a query, recall (preview the exact injected block), check (verify entry points resolve and their symbols exist), probe (run one extraction model call on supplied conversation text), add, forget, pin (set the pinned flag), stats, diag (hook counters, config source and store status).',
+      description: 'Inspect or edit the automatic workspace skill memory. Actions: list, search a query, recall (preview the exact injected block), check (verify entry points resolve and their symbols exist), alias (show the workspace repo aliases, or record one after the user gives you its path), probe (run one extraction model call on supplied conversation text), add, forget, pin (set the pinned flag), stats, diag (hook counters, config source and store status).',
       parameters: {
         type: 'object',
         properties: {
-          action: { type: 'string', enum: ['list', 'search', 'recall', 'check', 'probe', 'add', 'forget', 'pin', 'stats', 'diag'], description: 'Operation to perform.' },
+          action: { type: 'string', enum: ['list', 'search', 'recall', 'check', 'alias', 'probe', 'add', 'forget', 'pin', 'stats', 'diag'], description: 'Operation to perform.' },
           query: { type: 'string', description: 'Query for search/recall; conversation text for probe.' },
-          name: { type: 'string', description: 'Skill name for add.' },
+          name: { type: 'string', description: 'Skill name for add; alias name for alias when "alias" is not given.' },
+          alias: { type: 'string', description: 'Alias name for action=alias. Omit it to list every defined alias and every alias whose value is still missing.' },
+          path: { type: 'string', description: 'Alias value for action=alias: the absolute path of the other repository, exactly as the user gave it. Pass "-" to remove the alias.' },
           description: { type: 'string', description: 'One-line reason for add.' },
           instructions: { type: 'string', description: 'Imperative instructions for add.' },
           kind: { type: 'string', enum: ['api', 'workflow', 'gotcha', 'preference', 'note'], description: 'Knowledge kind for add.' },
@@ -1434,11 +1633,12 @@ export default {
         const agent = exec === null || exec === undefined ? undefined : exec.agent
         const sessionId = agent !== null && agent !== undefined && typeof agent.id === 'string' ? agent.id : ''
         const cwd = await workspaceFor(sessionId)
-        const state = await loadState(ctx, cwd)
+        const state = await loadState(ctx, cwd, machineConfig())
         const path = joinPath(cwd, LOCAL_FILE)
         const total = state.skills.length
         if (args.action === 'diag') {
           const aliasNames = Object.keys(state.config.aliases)
+          const missingAliasNames = unresolvedAliasNames(state, cwd, state.skills)
           const summary = [
             'pre-step calls ' + diag.preStep + ' (injected ' + diag.injected + ', no query ' + diag.noQuery + ', no workspace ' + diag.noWorkspace + ', no hits ' + diag.noHits + ')',
             'pre-step error: ' + (diag.preStepError.length > 0 ? diag.preStepError : 'none'),
@@ -1454,8 +1654,9 @@ export default {
             'symbols verified ' + diag.symbolVerified + ', not found ' + diag.symbolMissing + (diag.symbolMissingList.length > 0 ? ' -> ' + diag.symbolMissingList.join(' ; ') : ''),
             'settings namespace: ' + (settingsRegistered ? 'skill-memory registered via ' + (settingsPath.length > 0 ? settingsPath : 'unknown path') : 'not registered (' + settingsPath + ')' + (settingsError.length > 0 ? ' error=' + settingsError : '')) + ', flags: ' + (function () { const f = flags(); return 'enabled=' + f.enabled + ' recall=' + f.recall + ' learn=' + f.learn })(),
             'gated off: recall skipped ' + diag.skippedDisabled + ', learning skipped ' + diag.learnSkipped,
+            'machine settings: globalStore ' + (function () { const m = machineConfig(); return m.globalStore.length > 0 ? m.globalStore + ' (' + m.globalStoreSource + ')' : 'unset' })(),
             'config file: ' + (state.config.configRead ? state.config.configFile : 'none'),
-            'aliases: ' + (aliasNames.length > 0 ? aliasNames.join(', ') : 'none'),
+            'aliases (workspace config only): ' + (aliasNames.length > 0 ? aliasNames.map((name) => name + ' -> ' + resolveRepoRoot(state.config, cwd, name)).join(', ') : 'none') + (missingAliasNames.length > 0 ? ' | missing values: ' + missingAliasNames.join(', ') : ''),
             'global store: ' + (state.globalResolved.length > 0 ? state.globalResolved : 'disabled') + ' (source: ' + (state.config.globalSource.length > 0 ? state.config.globalSource : 'not configured') + ') readable=' + state.globalRead + ' writable=' + state.globalWritable + (state.globalError.length > 0 ? ' error=' + state.globalError : ''),
           ].join(' | ')
           return { ok: true, action: 'diag', workspace: cwd, store: path, total: total, count: 0, message: summary, preview: diag.lastRaw.length > 0 ? 'last extractor reply:\n' + diag.lastRaw : '', skills: [] }
@@ -1469,6 +1670,41 @@ export default {
             ok: true, action: 'check', workspace: cwd, store: path, total: total, count: notes.length,
             message: notes.length === 0 ? 'all entry points resolve, are unchanged, and their symbols exist' : notes.length + ' note(s)',
             preview: notes.join('\n'), skills: [],
+          }
+        }
+        if (args.action === 'alias') {
+          const asked = typeof args.alias === 'string' && args.alias.trim().length > 0 ? args.alias.trim() : (typeof args.name === 'string' ? args.name.trim() : '')
+          if (asked.length === 0) {
+            const missing = unresolvedAliasNames(state, cwd, state.skills)
+            return {
+              ok: true, action: 'alias', workspace: cwd, store: path, total: total, count: Object.keys(state.config.aliases).length,
+              message: missing.length > 0
+                ? missing.length + ' alias(es) have no value yet: ' + missing.join(', ') + '; ask the user for the path of each and record it with action=alias'
+                : 'every alias a stored skill references has a value',
+              preview: aliasReport(state, cwd).join('\n'), skills: [],
+            }
+          }
+          if (!/^[A-Za-z0-9._-]+$/.test(asked)) {
+            return { ok: false, action: 'alias', workspace: cwd, store: path, total: total, count: 0, message: 'alias names may only contain letters, digits, dot, dash and underscore', preview: '', skills: [] }
+          }
+          const rawPath = typeof args.path === 'string' ? args.path.trim() : ''
+          const value = rawPath === '-' ? '' : rawPath
+          if (value.length > 0) {
+            if (value.charAt(0) === '~') {
+              return { ok: false, action: 'alias', workspace: cwd, store: path, total: total, count: 0, message: 'the fs layer treats a leading tilde as a literal directory name; ask the user for the absolute path instead', preview: '', skills: [] }
+            }
+            if (!isAbsolutePath(value)) {
+              return { ok: false, action: 'alias', workspace: cwd, store: path, total: total, count: 0, message: 'the alias value must be the absolute path the user gave, for example /home/you/src/other-repo', preview: '', skills: [] }
+            }
+          }
+          const written = await writeAliasValue(ctx, cwd, asked, value)
+          if (written.ok !== true) {
+            return { ok: false, action: 'alias', workspace: cwd, store: path, total: total, count: 0, message: written.message, preview: '', skills: [] }
+          }
+          const refreshed = await loadState(ctx, cwd, machineConfig())
+          return {
+            ok: true, action: 'alias', workspace: cwd, store: path, total: refreshed.skills.length, count: 1,
+            message: written.message, preview: aliasReport(refreshed, cwd).join('\n'), skills: [],
           }
         }
         if (args.action === 'stats') {

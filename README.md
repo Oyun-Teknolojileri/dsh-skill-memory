@@ -11,7 +11,7 @@ works in.
   personal preferences - and creates or merges skills. A bounded queue drops
   work instead of blocking replies.
 - **Manage:** it registers a `skill_memory` tool with `list`, `search`, `recall`,
-  `check`, `probe`, `add`, `forget`, `pin`, `stats` and `diag`.
+  `check`, `alias`, `probe`, `add`, `forget`, `pin`, `stats` and `diag`.
 
 Plain JavaScript, no dependencies. It uses only DSH services (`tools`, `fs`,
 `llm`, `sessions`). No Python, no vector database, nothing to compile.
@@ -77,9 +77,31 @@ Create `<workspace>/.dsh-skill-memory.config.json`:
 
 | Key | Meaning |
 | --- | --- |
-| `aliases` | A skill entry point may name a repo alias instead of `self`. An alias is absolute, or relative to the workspace root. |
-| `globalStore` | Where personal/global skills live, shared by every workspace pointing at the same path. Absent means the global layer is disabled. |
+| `aliases` | A skill entry point may name a repo alias instead of `self`. An alias is absolute, or relative to the workspace root. This is the only place an alias is defined; see "Repo aliases" below. |
+| `globalStore` | Where personal/global skills live, shared by every workspace pointing at the same path. Absent falls back to the machine default (see Settings). |
 | `home` | Optional. Used only to expand a leading `~` in `globalStore`, because the fs layer treats a tilde as a literal directory name. |
+
+### Repo aliases
+
+A skill names its repos, not their paths: `engine:ToolKit/Resources/Scene.h`
+means "the `Scene.h` of whichever repository `engine` is". The name is what
+travels, and the workspace config file is where the name gets a value. That is
+deliberate: the config lives next to the store, so a learned skill set that is
+copied to another machine keeps every name and only needs the values again.
+
+There is no machine-wide alias table. When a stored skill references a name the
+config does not define:
+
+- the entry point is injected as `[alias "engine" has no path in the workspace
+  config, unresolved]` and the recall block lists the missing names once;
+- `skill_memory check` reports them the same way;
+- the agent asks you for the path and records it with
+  `skill_memory action=alias alias=engine path=/absolute/path/to/repo`, which
+  writes the workspace config for you. The plugin never guesses a path, and it
+  refuses a relative path or a `~`.
+
+`skill_memory action=alias` with no arguments lists every alias, its resolved
+root, the skills that use it, and every name still missing a value.
 
 ## Settings
 
@@ -98,6 +120,18 @@ half registers the card.
 The namespace declares `applies: 'live'`, so a toggle takes effect without a
 restart. Values are stored in the settings document; the composition row can also
 supply defaults under `config`.
+
+### Machine-wide configuration
+
+The namespace is a machine-wide layer and lives in the harness settings document
+(`$DSH_HOME/settings.yaml`), so every workspace on this machine reads the same
+values. It holds the global store location and nothing else: repo aliases are
+deliberately **not** here, because an alias belongs to the workspace whose skills
+use it and must travel with them.
+
+The global store needs no configuration at all: it lives in a `skill-memory.json`
+beside the settings document, which is the harness home. Set `globalStore` in a
+workspace config file only to point one workspace somewhere else.
 
 To remove the plugin from the UI entirely without uninstalling the package,
 disable the row in the profile's own patch layer
