@@ -1,6 +1,6 @@
 {
   "name": "dsh-skill-memory",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "DSH/Cordis plugin: learns durable workspace knowledge from completed turns and recalls it into each model step.",
   "repository": {
     "type": "git",

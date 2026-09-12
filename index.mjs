@@ -737,6 +737,70 @@ async function askModel(ctx, sessionId, system, userText, maxTokens) {
   return out
 }
 
+// End index of the array or object literal that starts at `start`, honoring
+// strings and escapes. -1 when the literal never closes.
+function matchBracket(text, start) {
+  const open = text.charAt(start)
+  const close = open === '[' ? ']' : '}'
+  let depth = 0
+  let inString = false
+  let escaped = false
+  for (let index = start; index < text.length; index += 1) {
+    const ch = text.charAt(index)
+    if (inString) {
+      if (escaped) escaped = false
+      else if (ch === '\\') escaped = true
+      else if (ch === '"') inString = false
+      continue
+    }
+    if (ch === '"') {
+      inString = true
+      continue
+    }
+    if (ch === open) depth += 1
+    else if (ch === close) {
+      depth -= 1
+      if (depth === 0) return index
+    }
+  }
+  return -1
+}
+
+// The first non-empty `"skills"` array carried by a reply. A model sometimes
+// emits the key twice - `{"skills":[ ...good... ],"skills":[]}` - and JSON.parse
+// keeps the last one, so the good list would be dropped and the turn would look
+// like it carried nothing. Recovering the first non-empty array keeps the
+// extraction the reply actually made.
+function firstSkillsArray(text) {
+  if (typeof text !== 'string') return undefined
+  const key = '"skills"'
+  let index = text.indexOf(key)
+  while (index >= 0) {
+    const colon = text.indexOf(':', index + key.length)
+    if (colon > 0) {
+      let start = colon + 1
+      while (start < text.length) {
+        const ch = text.charAt(start)
+        if (ch === ' ' || ch === '\n' || ch === '\r' || ch === '\t') start += 1
+        else break
+      }
+      if (text.charAt(start) === '[') {
+        const end = matchBracket(text, start)
+        if (end > start) {
+          try {
+            const value = JSON.parse(text.slice(start, end + 1))
+            if (Array.isArray(value) && value.length > 0) return value
+          } catch (error) {
+            // Not valid on its own; keep scanning for another occurrence.
+          }
+        }
+      }
+    }
+    index = text.indexOf(key, index + key.length)
+  }
+  return undefined
+}
+
 function parseExtraction(raw, diag) {
   if (typeof raw !== 'string' || raw.trim().length === 0) {
     if (diag !== undefined) diag.extractParseError = 'the reply was empty'
@@ -779,7 +843,7 @@ function parseExtraction(raw, diag) {
       lastError = errorText(error)
       continue
     }
-    const normalized = normalizeExtraction(parsed)
+    const normalized = normalizeExtraction(parsed, candidate, diag)
     if (normalized !== undefined) {
       if (diag !== undefined) diag.extractParseError = ''
       return normalized
@@ -790,17 +854,30 @@ function parseExtraction(raw, diag) {
   return undefined
 }
 
-function normalizeExtraction(parsed) {
-  if (Array.isArray(parsed)) return { skills: parsed }
+function normalizeExtraction(parsed, text, diag) {
+  // Recover a non-empty `skills` list the parsed value lost, and record it: the
+  // counter makes a duplicate-key reply visible in diag instead of silent.
+  const recover = () => {
+    const first = firstSkillsArray(text)
+    if (first !== undefined && first.length > 0) {
+      if (diag !== undefined) diag.extractDupRepairs += 1
+      return { skills: first }
+    }
+    return undefined
+  }
+  if (Array.isArray(parsed)) return parsed.length > 0 ? { skills: parsed } : (recover() || { skills: parsed })
   if (parsed === null || typeof parsed !== 'object') return undefined
-  if (Array.isArray(parsed.skills)) return { skills: parsed.skills }
+  if (Array.isArray(parsed.skills)) {
+    if (parsed.skills.length > 0) return { skills: parsed.skills }
+    return recover() || { skills: parsed.skills }
+  }
   if (typeof parsed.name === 'string' && typeof parsed.instructions === 'string') return { skills: [parsed] }
   for (const key of Object.keys(parsed)) {
     const value = parsed[key]
-    if (Array.isArray(value)) return { skills: value }
-    if (value !== null && typeof value === 'object' && Array.isArray(value.skills)) return { skills: value.skills }
+    if (Array.isArray(value) && value.length > 0) return { skills: value }
+    if (value !== null && typeof value === 'object' && Array.isArray(value.skills) && value.skills.length > 0) return { skills: value.skills }
   }
-  return undefined
+  return recover()
 }
 
 // ---------------------------------------------------------------- extraction
@@ -1086,7 +1163,7 @@ export default {
       preStep: 0, injected: 0, noQuery: 0, noWorkspace: 0, noHits: 0, preStepError: '',
       sessionEvents: 0, userMessages: 0, assistantMessages: 0, turnsCompleted: 0,
       extractRuns: 0, extractApplied: 0, extractChars: 0, extractError: '', lastRaw: '',
-      extractParseError: '', extractRetries: 0,
+      extractParseError: '', extractRetries: 0, extractDupRepairs: 0,
       lastEnteringKinds: '', lastQueryText: '', lastRecallScores: '',
       refStats: 0, refStatErrors: 0, refStatError: '',
       refRepoRepairs: 0, refRepoRepairList: [],
@@ -1370,7 +1447,7 @@ export default {
             'last scores: ' + (diag.lastRecallScores.length > 0 ? diag.lastRecallScores : 'n/a'),
             'session events ' + diag.sessionEvents + ' (human ' + diag.userMessages + ', assistant ' + diag.assistantMessages + ')',
             'completed turns ' + diag.turnsCompleted,
-            'extraction runs ' + diag.extractRuns + ', applied ' + diag.extractApplied + ', last reply chars ' + diag.extractChars + ', repair retries ' + diag.extractRetries,
+            'extraction runs ' + diag.extractRuns + ', applied ' + diag.extractApplied + ', last reply chars ' + diag.extractChars + ', repair retries ' + diag.extractRetries + ', duplicate-key repairs ' + diag.extractDupRepairs,
             'parse error: ' + (diag.extractParseError.length > 0 ? diag.extractParseError : 'none') + ', extraction error: ' + (diag.extractError.length > 0 ? diag.extractError : 'none'),
             'refs captured ' + diag.refStats + ', stat errors ' + diag.refStatErrors + (diag.refStatError.length > 0 ? ' (' + diag.refStatError + ')' : ''),
             'repo repairs ' + diag.refRepoRepairs + (diag.refRepoRepairList.length > 0 ? ' -> ' + diag.refRepoRepairList.join(' ; ') : ''),
