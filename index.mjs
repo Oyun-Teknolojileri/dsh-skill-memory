@@ -1018,15 +1018,41 @@ export default {
     let settingsService
     let settingsRegistered = false
     let settingsError = ''
+    let settingsPath = ''
+    const registerNamespace = (candidate) => {
+      if (candidate === undefined || candidate === null) return false
+      if (typeof candidate.register !== 'function') {
+        settingsPath = 'service found but register is ' + typeof candidate.register
+        return false
+      }
+      candidate.register('skill-memory', z.object({
+        enabled: z.boolean().default(true),
+        recall: z.boolean().default(true),
+        learn: z.boolean().default(true),
+      }), { applies: 'live' })
+      settingsService = candidate
+      settingsRegistered = true
+      return true
+    }
     try {
-      settingsService = ctx.get('settings')
-      if (settingsService !== undefined && typeof settingsService.register === 'function') {
-        settingsService.register('skill-memory', z.object({
-          enabled: z.boolean().default(true),
-          recall: z.boolean().default(true),
-          learn: z.boolean().default(true),
-        }), { applies: 'live' })
-        settingsRegistered = true
+      const direct = ctx.get('settings')
+      if (registerNamespace(direct)) {
+        settingsPath = 'direct at apply time'
+      } else {
+        settingsPath = 'direct read returned ' + String(direct === undefined ? 'undefined' : typeof direct)
+        // The provider may not be visible from this fiber yet; wait for it instead
+        // of giving up, which is what a missing registration looked like.
+        if (typeof ctx.inject === 'function') {
+          ctx.inject(['settings'], (scoped) => {
+            try {
+              if (registerNamespace(scoped.get('settings'))) settingsPath = 'deferred via ctx.inject'
+            } catch (error) {
+              settingsError = errorText(error)
+            }
+          })
+        } else {
+          settingsPath += ' and ctx.inject is ' + typeof ctx.inject
+        }
       }
     } catch (error) {
       settingsError = errorText(error)
@@ -1349,7 +1375,7 @@ export default {
             'refs captured ' + diag.refStats + ', stat errors ' + diag.refStatErrors + (diag.refStatError.length > 0 ? ' (' + diag.refStatError + ')' : ''),
             'repo repairs ' + diag.refRepoRepairs + (diag.refRepoRepairList.length > 0 ? ' -> ' + diag.refRepoRepairList.join(' ; ') : ''),
             'symbols verified ' + diag.symbolVerified + ', not found ' + diag.symbolMissing + (diag.symbolMissingList.length > 0 ? ' -> ' + diag.symbolMissingList.join(' ; ') : ''),
-            'settings namespace: ' + (settingsRegistered ? 'skill-memory registered' : 'not registered' + (settingsError.length > 0 ? ' (' + settingsError + ')' : '')) + ', flags: ' + (function () { const f = flags(); return 'enabled=' + f.enabled + ' recall=' + f.recall + ' learn=' + f.learn })(),
+            'settings namespace: ' + (settingsRegistered ? 'skill-memory registered via ' + (settingsPath.length > 0 ? settingsPath : 'unknown path') : 'not registered (' + settingsPath + ')' + (settingsError.length > 0 ? ' error=' + settingsError : '')) + ', flags: ' + (function () { const f = flags(); return 'enabled=' + f.enabled + ' recall=' + f.recall + ' learn=' + f.learn })(),
             'gated off: recall skipped ' + diag.skippedDisabled + ', learning skipped ' + diag.learnSkipped,
             'config file: ' + (state.config.configRead ? state.config.configFile : 'none'),
             'aliases: ' + (aliasNames.length > 0 ? aliasNames.join(', ') : 'none'),

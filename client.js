@@ -19,7 +19,7 @@ window.__ModuleLoader__.load({
     const h = React.createElement;
 
     const NS = 'skill-memory';
-    const inject = ['slots'];
+    const inject = ['slots', 'remote', 'remote.settings'];
 
     const { useState, useEffect, useCallback } = React;
 
