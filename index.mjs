@@ -44,7 +44,7 @@ const MAX_RECALL_CHARS = 4000
 const DIGEST_MESSAGES = 40
 const DIGEST_CHARS = 1500
 const MIN_CONFIDENCE = 0.5
-const EXTRACT_MAX_TOKENS = 1800
+const EXTRACT_MAX_TOKENS = 3500
 const MAX_PENDING_JOBS = 8
 const SIMILARITY_KEEP = 0.6
 const VERIFY_MAX_BYTES = 400000
@@ -573,14 +573,41 @@ async function writeAliasValue(ctx, cwd, name, value) {
 // ------------------------------------------------------------------ store
 const storeCache = new Map()
 
+// Cheap freshness token for a store file: absent, or its version and size. Used
+// to notice a store that changed outside this process (another session, a hand
+// edit, a reset) instead of serving a cached copy forever.
+async function storeToken(ctx, path, cwd) {
+  const fs = ctx.get('fs')
+  if (fs === undefined || path.length === 0) return ''
+  try {
+    const target = await fs.resolve(isAbsolutePath(path) ? path : joinPath(cwd, path), {})
+    const info = await fs.stat(target)
+    if (info === undefined || info === null) return 'absent'
+    return String(info.version === undefined || info.version === null ? '' : info.version) + ':' + String(info.size === undefined ? '' : info.size)
+  } catch (error) {
+    return 'absent'
+  }
+}
+
 async function loadState(ctx, cwd, machine) {
   // The machine layer can change while the process runs (a settings edit), so the
   // cached state is keyed by its resolved values and rebuilt when they differ.
+  // It is also keyed by the stores themselves: a store edited outside this process
+  // must be re-read, otherwise a deleted skill would come back on the next write.
   const signature = machine === undefined ? '' : JSON.stringify(machine)
   const cached = storeCache.get(cwd)
-  if (cached !== undefined && cached.signature === signature) return cached
+  if (cached !== undefined && cached.signature === signature) {
+    const localToken = await storeToken(ctx, joinPath(cwd, LOCAL_FILE), cwd)
+    const globalToken = await storeToken(ctx, cached.config.globalStore, cwd)
+    if (localToken === cached.localToken && globalToken === cached.globalToken) return cached
+  }
   const config = await readConfig(ctx, cwd, machine)
-  const state = { skills: [], config: config, signature: signature, globalWritable: false, globalError: config.globalStoreError, globalRead: false, globalResolved: '' }
+  const state = {
+    skills: [], config: config, signature: signature,
+    localToken: await storeToken(ctx, joinPath(cwd, LOCAL_FILE), cwd),
+    globalToken: await storeToken(ctx, config.globalStore, cwd),
+    globalWritable: false, globalError: config.globalStoreError, globalRead: false, globalResolved: '',
+  }
   if (cwd.length > 0) {
     if (config.globalStore.length > 0) {
       state.globalWritable = true
@@ -945,6 +972,63 @@ function firstSkillsArray(text) {
   return undefined
 }
 
+// Close a JSON value that the model cut off mid-stream: terminate an open string,
+// drop a dangling comma, then append the closers the bracket stack still waits for.
+// A truncated reply is common (reasoning shares the token budget), and without this
+// the whole turn's extraction would be thrown away.
+function closeTruncatedJson(text) {
+  const stack = []
+  let inString = false
+  let escaped = false
+  for (let index = 0; index < text.length; index += 1) {
+    const ch = text.charAt(index)
+    if (inString) {
+      if (escaped) escaped = false
+      else if (ch === '\\') escaped = true
+      else if (ch === '"') inString = false
+      continue
+    }
+    if (ch === '"') inString = true
+    else if (ch === '{' || ch === '[') stack.push(ch)
+    else if (ch === '}' || ch === ']') stack.pop()
+  }
+  let out = text
+  if (inString) {
+    if (escaped) out += '\\'
+    out += '"'
+  }
+  out = out.replace(/,[\s]*$/, '')
+  for (let index = stack.length - 1; index >= 0; index -= 1) {
+    out += stack[index] === '{' ? '}' : ']'
+  }
+  return out
+}
+
+// Last resort: keep every skill object that is already complete inside the skills
+// array, so one cut-off object costs only itself and not the whole turn.
+function salvageSkillsArray(text) {
+  if (typeof text !== 'string') return undefined
+  const key = '"skills"'
+  const keyIndex = text.indexOf(key)
+  if (keyIndex < 0) return undefined
+  const open = text.indexOf('[', keyIndex)
+  if (open < 0) return undefined
+  const salvaged = []
+  let index = text.indexOf('{', open + 1)
+  while (index > 0) {
+    const end = matchBracket(text, index)
+    if (end < 0) break
+    try {
+      const value = JSON.parse(text.slice(index, end + 1))
+      if (value !== null && typeof value === 'object' && typeof value.name === 'string') salvaged.push(value)
+    } catch (error) {
+      // Skip an object that is broken on its own.
+    }
+    index = text.indexOf('{', end + 1)
+  }
+  return salvaged.length > 0 ? salvaged : undefined
+}
+
 function parseExtraction(raw, diag) {
   if (typeof raw !== 'string' || raw.trim().length === 0) {
     if (diag !== undefined) diag.extractParseError = 'the reply was empty'
@@ -978,6 +1062,7 @@ function parseExtraction(raw, diag) {
     for (let index = 0; index < opens - closes; index += 1) repaired += '}'
     candidates.push(repaired)
   }
+  candidates.push(closeTruncatedJson(body))
   let lastError = ''
   for (const candidate of candidates) {
     let parsed
@@ -993,6 +1078,15 @@ function parseExtraction(raw, diag) {
       return normalized
     }
     lastError = 'parsed JSON had no skill list'
+  }
+  const salvaged = salvageSkillsArray(body)
+  if (salvaged !== undefined) {
+    if (diag !== undefined) {
+      diag.extractParseError = ''
+      if (typeof diag.extractSalvaged === 'number') diag.extractSalvaged += 1
+      else diag.extractSalvaged = 1
+    }
+    return { skills: salvaged }
   }
   if (diag !== undefined) diag.extractParseError = lastError.length > 0 ? lastError : 'the reply could not be parsed'
   return undefined
@@ -1063,6 +1157,8 @@ const EXTRACT_SYSTEM = [
   '',
   'refs entries look like {"repo":"self","path":"relative/path/From/That/Root.h","symbol":"Class::Method"}.',
   'Only record refs for paths and symbols that actually appeared in the turn.',
+  'A ref must carry a path. If you know the symbol but not the file it lives in,',
+  'leave that ref out entirely instead of sending an empty path.',
   '',
   'triggers are 3 to 8 short phrases that should load this skill later, using the',
   'words a person would naturally say when asking for it, in the conversation',
@@ -1076,6 +1172,8 @@ const EXTRACT_SYSTEM = [
   '',
   'Reply with STRICT JSON only. No prose, no markdown fence. Keep every string on',
   'one line: never put a raw newline inside a JSON string.',
+  'Keep instructions under 700 characters and the whole reply under 1500 characters,',
+  'otherwise the reply is cut off and the turn is lost.',
   'Exact shape:',
   '{"skills":[{"action":"new","target_id":"","kind":"api","scope":"workspace","pinned":false,"name":"short name","description":"one line why","instructions":"imperative, self-contained rules","triggers":["phrase"],"refs":[{"repo":"self","path":"src/File.h","symbol":"Class::Method"}],"tags":["tag"],"confidence":0.0,"evidence":"short quote"}]}',
   'Return {"skills":[]} only when the turn carries nothing durable.',
@@ -1139,8 +1237,8 @@ function buildDigest(messages) {
   return lines.join('\n\n')
 }
 
-async function analyzeTurn(ctx, sessionId, cwd, digest, diag) {
-  const state = await loadState(ctx, cwd, machineConfig())
+async function analyzeTurn(ctx, sessionId, cwd, digest, diag, machine) {
+  const state = await loadState(ctx, cwd, machine)
   const existing = state.skills.map((skill) => ({
     id: skill.id,
     name: skill.name,
@@ -1360,7 +1458,7 @@ export default {
       preStep: 0, injected: 0, noQuery: 0, noWorkspace: 0, noHits: 0, preStepError: '',
       sessionEvents: 0, userMessages: 0, assistantMessages: 0, turnsCompleted: 0,
       extractRuns: 0, extractApplied: 0, extractChars: 0, extractError: '', lastRaw: '',
-      extractParseError: '', extractRetries: 0, extractDupRepairs: 0,
+      extractParseError: '', extractRetries: 0, extractDupRepairs: 0, extractSalvaged: 0,
       lastEnteringKinds: '', lastQueryText: '', lastRecallScores: '',
       refStats: 0, refStatErrors: 0, refStatError: '',
       refRepoRepairs: 0, refRepoRepairList: [],
@@ -1462,7 +1560,7 @@ export default {
         }
         enqueueJob('skill extraction', async () => {
           diag.extractRuns += 1
-          const applied = await analyzeTurn(ctx, sessionId, workspace, digest, diag)
+          const applied = await analyzeTurn(ctx, sessionId, workspace, digest, diag, machineConfig())
           diag.extractApplied += applied.length
           if (applied.length > 0) {
             const summary = applied.map((entry) => entry.action + ':' + entry.name + ' v' + entry.version).join(', ')
@@ -1647,7 +1745,7 @@ export default {
             'last scores: ' + (diag.lastRecallScores.length > 0 ? diag.lastRecallScores : 'n/a'),
             'session events ' + diag.sessionEvents + ' (human ' + diag.userMessages + ', assistant ' + diag.assistantMessages + ')',
             'completed turns ' + diag.turnsCompleted,
-            'extraction runs ' + diag.extractRuns + ', applied ' + diag.extractApplied + ', last reply chars ' + diag.extractChars + ', repair retries ' + diag.extractRetries + ', duplicate-key repairs ' + diag.extractDupRepairs,
+            'extraction runs ' + diag.extractRuns + ', applied ' + diag.extractApplied + ', last reply chars ' + diag.extractChars + ', repair retries ' + diag.extractRetries + ', duplicate-key repairs ' + diag.extractDupRepairs + ', truncated replies salvaged ' + diag.extractSalvaged,
             'parse error: ' + (diag.extractParseError.length > 0 ? diag.extractParseError : 'none') + ', extraction error: ' + (diag.extractError.length > 0 ? diag.extractError : 'none'),
             'refs captured ' + diag.refStats + ', stat errors ' + diag.refStatErrors + (diag.refStatError.length > 0 ? ' (' + diag.refStatError + ')' : ''),
             'repo repairs ' + diag.refRepoRepairs + (diag.refRepoRepairList.length > 0 ? ' -> ' + diag.refRepoRepairList.join(' ; ') : ''),
@@ -1739,7 +1837,7 @@ export default {
             return { ok: false, action: 'probe', workspace: cwd, store: path, total: total, count: 0, message: 'pass the conversation text to analyze in query (at least 20 chars)', preview: '', skills: [] }
           }
           diag.extractRuns += 1
-          const applied = await analyzeTurn(ctx, sessionId, cwd, digest, diag)
+          const applied = await analyzeTurn(ctx, sessionId, cwd, digest, diag, machineConfig())
           diag.extractApplied += applied.length
           const names = applied.map((entry) => entry.action + ':' + entry.name + ' v' + entry.version).join(', ')
           const message = 'model reply ' + diag.extractChars + ' chars, applied ' + applied.length + (names.length > 0 ? ' -> ' + names : '') + (diag.extractError.length > 0 ? ', error: ' + diag.extractError : '')
