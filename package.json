@@ -1,6 +1,6 @@
 {
   "name": "dsh-skill-memory",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "DSH/Cordis plugin: learns durable workspace knowledge from completed turns and recalls it into each model step.",
   "repository": {
     "type": "git",
@@ -11,10 +11,12 @@
   "exports": {
     ".": "./index.mjs",
     "./cordis.patch.yml": "./cordis.patch.yml",
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./client": "./client.js"
   },
   "files": [
     "index.mjs",
+    "client.js",
     "cordis.patch.yml",
     "README.md"
   ],
@@ -24,6 +26,12 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-api-remotes"
+      ]
     }
   },
   "keywords": [

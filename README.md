@@ -38,6 +38,15 @@ dsh plugin --profile web add dsh-skill-memory
 reconciles `dsh.profile.bundles` against what is installed, so a dependency that
 declares `dsh.bundle` joins the layer stack by itself.
 
+`dsh plugin` requires **pnpm** on `PATH`. Without it the command stops with
+`pnpm not found on PATH - install pnpm to manage profile plugins`. A rootless
+install is enough:
+
+```sh
+npm install -g --prefix "$HOME/.local" pnpm
+export PATH="$HOME/.local/bin:$PATH"
+```
+
 Restart the profile afterwards, or rely on the profile's patch reload.
 
 ### Verify
@@ -71,6 +80,33 @@ Create `<workspace>/.dsh-skill-memory.config.json`:
 | `aliases` | A skill entry point may name a repo alias instead of `self`. An alias is absolute, or relative to the workspace root. |
 | `globalStore` | Where personal/global skills live, shared by every workspace pointing at the same path. Absent means the global layer is disabled. |
 | `home` | Optional. Used only to expand a leading `~` in `globalStore`, because the fs layer treats a tilde as a literal directory name. |
+
+## Settings
+
+The plugin registers the `skill-memory` settings namespace and ships a browser
+half, so it appears under **Settings -> Plugins** with its own card. The Plugins
+section renders one card per namespace the Host serves, keyed by that namespace,
+which is why both halves exist: the Host registers the namespace, the browser
+half registers the card.
+
+| Switch | Effect |
+| --- | --- |
+| **Enabled** | Master switch. Off stops recall and learning; the `skill_memory` tool stays available. |
+| **Recall** | Inject matching skills into each model step, and pinned skills into every step. |
+| **Learn** | Analyze each completed turn in the background and store or update skills. |
+
+The namespace declares `applies: 'live'`, so a toggle takes effect without a
+restart. Values are stored in the settings document; the composition row can also
+supply defaults under `config`.
+
+To remove the plugin from the UI entirely without uninstalling the package,
+disable the row in the profile's own patch layer
+(`$DSH_HOME/profiles/<profile>/cordis.patch.yml`):
+
+```yaml
+- id: skill-memory
+  disabled: true
+```
 
 ## Stores
 

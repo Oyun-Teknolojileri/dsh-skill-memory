@@ -25,6 +25,8 @@
 // Portability: this source contains no machine-specific values, and persisted
 // skill records never embed an absolute workspace path.
 // ============================================================================
+import z from '@deepseek-ai/schemastery'
+
 const PLUGIN_NAME = 'skill-memory'
 const LOCAL_FILE = '.dsh-skill-memory.json'
 const CONFIG_FILE = '.dsh-skill-memory.config.json'
@@ -1009,6 +1011,48 @@ async function analyzeTurn(ctx, sessionId, cwd, digest, diag) {
 export default {
   inject: ['tools'],
   apply(ctx) {
+    // Settings namespace. The Plugins settings section renders one card per
+    // namespace the Host serves, so registering this namespace is what makes the
+    // plugin appear there; the browser half registers the matching card under the
+    // same key. `applies: 'live'` means a toggle takes effect without a restart.
+    let settingsService
+    let settingsRegistered = false
+    let settingsError = ''
+    try {
+      settingsService = ctx.get('settings')
+      if (settingsService !== undefined && typeof settingsService.register === 'function') {
+        settingsService.register('skill-memory', z.object({
+          enabled: z.boolean().default(true),
+          recall: z.boolean().default(true),
+          learn: z.boolean().default(true),
+        }), { applies: 'live' })
+        settingsRegistered = true
+      }
+    } catch (error) {
+      settingsError = errorText(error)
+      console.log('[' + PLUGIN_NAME + '] settings registration failed: ' + settingsError)
+    }
+
+    // Resolved settings, re-read on every use so a live toggle needs no cache
+    // invalidation. `enabled` is the master switch; `recall` and `learn` gate the
+    // two automatic halves independently.
+    function flags() {
+      const fallback = { enabled: true, recall: true, learn: true }
+      if (settingsService === undefined) return fallback
+      let value
+      try {
+        value = settingsService.get('skill-memory')
+      } catch (error) {
+        return fallback
+      }
+      if (value === null || typeof value !== 'object') return fallback
+      return {
+        enabled: value.enabled !== false,
+        recall: value.recall !== false,
+        learn: value.learn !== false,
+      }
+    }
+
     const buffers = new Map()
     const lastQuery = new Map()
     const jobs = { pending: 0, chain: Promise.resolve() }
@@ -1021,6 +1065,7 @@ export default {
       refStats: 0, refStatErrors: 0, refStatError: '',
       refRepoRepairs: 0, refRepoRepairList: [],
       symbolVerified: 0, symbolMissing: 0, symbolMissingList: [],
+      skippedDisabled: 0, learnSkipped: 0,
     }
 
     async function workspaceFor(sessionId) {
@@ -1110,6 +1155,11 @@ export default {
         const digest = buildDigest(messages)
         if (digest.length < 80) return
         const workspace = buffer.cwd
+        const learnFlags = flags()
+        if (!learnFlags.enabled || !learnFlags.learn) {
+          diag.learnSkipped += 1
+          return
+        }
         enqueueJob('skill extraction', async () => {
           diag.extractRuns += 1
           const applied = await analyzeTurn(ctx, sessionId, workspace, digest, diag)
@@ -1128,6 +1178,11 @@ export default {
     ctx.on('agent/pre-step', async (payload, next) => {
       diag.preStep += 1
       const decision = await next()
+      const liveFlags = flags()
+      if (!liveFlags.enabled || !liveFlags.recall) {
+        diag.skippedDisabled += 1
+        return decision
+      }
       try {
         if (decision === undefined || decision === null || decision.kind !== 'enter') return decision
         const proposed = Array.isArray(decision.messages) ? decision.messages : (payload !== undefined && payload !== null && Array.isArray(payload.messages) ? payload.messages : [])
@@ -1294,6 +1349,8 @@ export default {
             'refs captured ' + diag.refStats + ', stat errors ' + diag.refStatErrors + (diag.refStatError.length > 0 ? ' (' + diag.refStatError + ')' : ''),
             'repo repairs ' + diag.refRepoRepairs + (diag.refRepoRepairList.length > 0 ? ' -> ' + diag.refRepoRepairList.join(' ; ') : ''),
             'symbols verified ' + diag.symbolVerified + ', not found ' + diag.symbolMissing + (diag.symbolMissingList.length > 0 ? ' -> ' + diag.symbolMissingList.join(' ; ') : ''),
+            'settings namespace: ' + (settingsRegistered ? 'skill-memory registered' : 'not registered' + (settingsError.length > 0 ? ' (' + settingsError + ')' : '')) + ', flags: ' + (function () { const f = flags(); return 'enabled=' + f.enabled + ' recall=' + f.recall + ' learn=' + f.learn })(),
+            'gated off: recall skipped ' + diag.skippedDisabled + ', learning skipped ' + diag.learnSkipped,
             'config file: ' + (state.config.configRead ? state.config.configFile : 'none'),
             'aliases: ' + (aliasNames.length > 0 ? aliasNames.join(', ') : 'none'),
             'global store: ' + (state.globalResolved.length > 0 ? state.globalResolved : 'disabled') + ' (source: ' + (state.config.globalSource.length > 0 ? state.config.globalSource : 'not configured') + ') readable=' + state.globalRead + ' writable=' + state.globalWritable + (state.globalError.length > 0 ? ' error=' + state.globalError : ''),
